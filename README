@@ -2,3 +2,5 @@ This is a collection of plugins for Luakit.  They should all work with the stand
 	* nscript_widget.lua - adds a status bar widget to indicate if scripts and plugins are enabled or disabled
 	* private_browsing.lua - prevents domains with enable_private_browsing from being added to the history record.  It also adds a status bar widget idicating if private browsing is on in the current tab.
 	* useragent.lua - this is a user agent changer for luakit, with a menu-driven interface and allows complete contol of user agents on a per-tab basis.  It adds a status bar widget to indicate the user agent that the curret tab is using.
+	* multisession.lua - multiple session support
+	* policy.lua - a RequestPolicy Clone, this is unfinished but in a usable state (I am running it as-is full time on as part of my luakit config)
