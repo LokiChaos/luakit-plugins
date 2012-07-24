@@ -35,6 +35,9 @@ local new_mode, menu_binds = new_mode, menu_binds
 local lfs = require("lfs")
 local setmetatable = setmetatable
 
+local tld = require("tld")
+local getdomain = tld.getdomain
+
 -- Calls modifed adblock
 --local adblock = require("plugins.adblock")
 
@@ -135,28 +138,6 @@ local getextension = function (uri)
 	return "NONE"
 end
 
--- Returns the (probable_main domain.tld or domain.2tld.tld) of the given host
--- Eg: api.google.com    > google.com
---     hats.amazon.co.jp > amazon.co.jp
--- XXX: This is _not_ perfect, but it should handle the most common domain cases.
--- There is no proper way to handle this with just glob-matching (or even regex)
-local getdomain = function (host)
-	if host then
-		local bits = util.table.reverse(util.string.split(host, "%.") or {})
-		-- Host is an IP, domain == IP
-		if #bits < 3 or (bits[1] and string.match(bits[1], "^%d+$")) then
-			return host
-		else
-			local phost = bits[2] .. "." .. bits[1]
-			if string.len(phost) < 6 then
-				return bits[3] .. "." .. phost
-			else
-				return phost
-			end
-		end
-	end
-end
-
 -- Check if query is domain or a subdomain of host
 local subdomainmatch = function(host, query)
 	if host == query then
@@ -165,7 +146,7 @@ local subdomainmatch = function(host, query)
 		local abits = util.string.split(string.reverse(host) or "", "%.")
 		local bbits = util.string.split(string.reverse(query) or "", "%.")
 		-- If host is an IP abort, eg: 10.8.4.1 is not a subdomain of 8.4.1
-		if abits[1] and string.match(abits[1], "^%d+$") then return false end
+		if host and string.match(host, "^%d%.%d%.%d%.%d$") then return false end
 		for i,s in ipairs(abits) do
 			if s ~= bbits[i] then
 				return false
@@ -187,9 +168,8 @@ local domainmatch = function (a, b)
 		local bbits = util.string.split(string.reverse(b) or "", "%.")
 		local matching = 0
 		-- If an IP, don't do partial matches
-		if abits[1] and string.match(abits[1], "^%d+$") then
-			return false
-		end
+		if string.match(a, "^%d%.%d%.%d%.%d$") then return false end
+
 		for i,s in ipairs(abits) do
 			if s == bbits[i] then
 				matching = matching + 1
@@ -197,8 +177,12 @@ local domainmatch = function (a, b)
 				break
 			end
 		end
-		-- XXX: again, this is a dirty hack to deal with 2 part "tlds" eg: .co.jp
-		local needed_match = 1 + (string.len(abits[1] or "123") < 3 and string.len(abits[2] or "123") < 3 and 1 or 0)
+		-- Check the effective tlds of a and b and use that + 1 as the minimum matching requirement
+		local adom = getdomain(a)
+		local bdom = getdomain(b)
+		local ab = util.string.split(adom)
+		local bb = util.string.split(bdom)
+		local needed_match = ( (#ab > #bb) and #ab) or #bb
 		if matching > needed_match then
 			return true
 		end
@@ -210,16 +194,14 @@ end
 local islisted = function (host, rhost, typ, party)
 	if party == THIRD_PARTY then
 		local host_bits = util.table.reverse(util.string.split(host or "", "%.") or {})
-		local phost = host
-		local n = 3
-		-- Check for long hosts and non IPs
-		if host and #host_bits > 2 and not string.match(host_bits[1], "^%d+$") then	
-			phost = host_bits[2] .. "." .. host_bits[1]
-			if string.len(phost) < 5 then
-				-- XXX again, same dirty trick to deal with .co.jp "tlds"
-				phost = host_bits[3] .. "." .. phost
-				n = 4
-			end
+		-- Get base domain, we do not want to match vs. just public suffixes
+		local n = 1
+		local phost = getdomain(host)
+		if not string.match(phost, "^[0-9%.]$") then
+			local pbits = util.string.split(phost, "%.")
+			n = #pbits + 1
+		else
+			n = #host_bits
 		end
 		-- Make list to match rhost against
 		local list = rpdb:exec(string.format("SELECT * FROM tp_%slist WHERE domain = %s;", typ, sql_escape("all")))
@@ -585,6 +567,8 @@ local rp_command = function(command, w, a)
 	-- Attempt to get a host/rhost out of args
 	local host  = args[1] and ((args[1] == "all" and "all") or (lousy.uri.parse(args[1]) or {}).host)
 	local rhost = args[2] and ((args[2] == "all" and "all") or (lousy.uri.parse(args[2]) or {}).host)
+
+	--TODO add host/rhost cheking vs public suffixes with getdomain()
 		if command == "wl" or command == "whitelist" then
 			if #args == 1 then
 				if host then
@@ -734,15 +718,17 @@ new_mode("policymenu", {
 				reasons = reasons .. (k and " ") .. k
 			end
 			local notcdr = domainmatch(main, host)
+			local domain = string.gsub(getdomain(host), "[%.%-]", "%%%1")
+			local formhost = string.gsub(host, domain, "<u>" .. domain .. "</u>")
 			if host == main then
 				main_row = {
-				" " .. host .. "", string.format(template, pol.accept ,pol.deny, ((reasons ~= "") and reason.start .. reasons .. reason.ends) or ""),
+				" " .. formhost .. "", string.format(template, pol.accept ,pol.deny, ((reasons ~= "") and reason.start .. reasons .. reason.ends) or ""),
                 host = host, pol = pol,
                 fg = (notcdr and afg) or ifg,
                 bg = ibg}
 			else
 	            table.insert(rows, (notcdr and 1) or #rows +1,
-				{   " " .. host .. "", string.format(template, pol.accept ,pol.deny, ((reasons ~= "") and reason.start .. reasons .. reason.ends) or ""),
+				{   " " .. formhost .. "", string.format(template, pol.accept ,pol.deny, ((reasons ~= "") and reason.start .. reasons .. reason.ends) or ""),
         	        host = host, pol = pol,
             	    fg = (notcdr and afg) or ifg,
                 	bg = ibg,
@@ -756,7 +742,7 @@ new_mode("policymenu", {
 		-- Add title row entry
 		table.insert(rows, 1, { "Domains requested by " .. main, "Actions Taken", title = true })
         w.menu:build(rows)
-        w:notify("Use j/k to move, Enter to select a host and open actions submeny, or h to open policy help (and full list of actions).", false)
+        w:notify("Use j/k to move, Enter to select a host and open actions submenu, or h to open policy help (and full list of actions).", false)
     end,
 
     leave = function (w)
@@ -772,7 +758,6 @@ new_mode("policysubmenu", {
         local ibg = theme.rpolicy_inactive_menu_bg or theme.proxy_inactive_menu_bg
 		local host = navto[w.view].selectedhost or "REQ_HOST"
 		local main = (lousy.uri.parse(w.view.uri or "") or {}).host or "HOST"
-		-- TODO make this menu smart, and only have entried that are applicable
         local rows = {{ "Actions for " .. host , "Command", title = true }}
 
 		-- plain whitelist/blacklist
