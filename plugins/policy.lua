@@ -6,7 +6,7 @@
 --  and rough per-domain file-type filtering based on URI patterns           --
 --                                                                           --
 -- Disclaimer: while this is intended to increase browser security and       --
--- help protect privacy, there is no guarntee.  Rely on it at your own risk! --
+-- help protect privacy, there is no guarantee.  Rely on it at your own risk! --
 -------------------------------------------------------------------------------
 
 local info = info
@@ -24,7 +24,7 @@ local tonumber = tonumber
 local webview = webview
 local window = window
 local lousy = require("lousy")
-local theme = require("theme")
+local theme = theme
 local widget = widget
 local util = lousy.util
 local chrome = require("chrome")
@@ -35,19 +35,16 @@ local new_mode, menu_binds = new_mode, menu_binds
 local lfs = require("lfs")
 local setmetatable = setmetatable
 
+-- Public Suffix Lib
 local tld = require("tld")
 local getdomain = tld.getdomain
 
 -- Calls modifed adblock
---local adblock = require("plugins.adblock")
+local adblock = require("plugins.adblock")
 
 module("plugins.policy")
 
-pdebug = function (...)
-	if true then
-		io.stdout:write(string.format(...) .. "\n")
-	end
-end
+pdebug = function (...) io.stdout:write(string.format(...) .. "\n") end
 
 -- Settings Flags =============================================================
 filtering = {
@@ -60,18 +57,25 @@ filtering = {
 	-- Flag to enable/disable file-type blocking policy
 	typepolicy = true,
 	-- Flag for whether a subdomain is treated as a 3rd party relative to other subdomains or master domain
-	strictsubdomain = false
+	strictsubdomain = false,
+	-- Flas for whether to show status bar widget
+	widget = true
 }
 
 local policy_dir = capi.luakit.data_dir
+
+-- Below is the actual internals of the plugin, here be dragons ---------------
+-------------------------------------------------------------------------------
+
+-- Cache to reduce sql calls
+local cache = {}
+setmetatable(cache, { __mode = "k" })
 
 -- A table to store data for navigation and resource requests
 -- it has per-view instances, indexed via navto[v].fields
 local navto = {}
 setmetatable(navto, { __mode = "k" })
 
--- Below is the actual internals of the plugin, here be dragons ---------------
--------------------------------------------------------------------------------
 -- Exception listing
 local exlist = { white = {}, third = {white = {} } }
 
@@ -88,23 +92,18 @@ PRAGMA synchronous = OFF;
 PRAGMA secure_delete = 1;
 CREATE TABLE IF NOT EXISTS whitelist (
 	id INTEGER PRIMARY KEY,
-	domain TEXT UNIQUE
-);
+	domain TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS blacklist (
 	id INTEGER PRIMARY KEY,
-	domain TEXT UNIQUE
-);
+	domain TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS tp_whitelist (
 	id INTEGER PRIMARY KEY,
 	domain TEXT,
-	rdomain TEXT
-
-);
+	rdomain TEXT);
 CREATE TABLE IF NOT EXISTS tp_blacklist (
 	id INTEGER PRIMARY KEY,
 	domain TEXT,
-	rdomain TEXT
-);
+	rdomain TEXT);
 ]]
 
 local sql_format = {
@@ -113,9 +112,10 @@ local sql_format = {
 	remove_list            = "DELETE FROM %slist WHERE domain == %s;",
 	match_tp_list          = "SELECT * FROM tp_%slist WHERE domain == %s and rdomain == %s;",
 	add_tp_list            = "INSERT INTO tp_%slist VALUES (NULL, %s, %s);",
+	remove_tp_list_exact   = "DELETE FROM tp_%slist WHERE domain == %s and rdomain == %s;",
+
 	remove_tp_list_domain  = "DELETE FROM tp_%slist WHERE domain == %s;",
 	remove_tp_list_rdomain = "DELETE FROM tp_%slist WHERE rdomain == %s;",
-	remove_tp_list_exact   = "DELETE FROM tp_%slist WHERE domain == %s and rdomain == %s;",
 }
 
 -- Open or create & initiaze dbi
@@ -143,10 +143,11 @@ local subdomainmatch = function(host, query)
 	if host == query then
 		return true
 	else
-		local abits = util.string.split(string.reverse(host) or "", "%.")
-		local bbits = util.string.split(string.reverse(query) or "", "%.")
+		local abits = util.string.split(string.reverse(host or ""), "%.")
+		local bbits = util.string.split(string.reverse(query or ""), "%.")
 		-- If host is an IP abort, eg: 10.8.4.1 is not a subdomain of 8.4.1
 		if host and string.match(host, "^%d%.%d%.%d%.%d$") then return false end
+		-- TODO ipv6 match
 		for i,s in ipairs(abits) do
 			if s ~= bbits[i] then
 				return false
@@ -167,9 +168,9 @@ local domainmatch = function (a, b)
 		local abits = util.string.split(string.reverse(a) or "", "%.")
 		local bbits = util.string.split(string.reverse(b) or "", "%.")
 		local matching = 0
-		-- If an IP, don't do partial matches
+		-- If an IP, don't do partial matches, TODO ipv6 match
 		if string.match(a, "^%d%.%d%.%d%.%d$") then return false end
-
+		-- Count matching bits
 		for i,s in ipairs(abits) do
 			if s == bbits[i] then
 				matching = matching + 1
@@ -178,12 +179,10 @@ local domainmatch = function (a, b)
 			end
 		end
 		-- Check the effective tlds of a and b and use that + 1 as the minimum matching requirement
-		local adom = getdomain(a)
-		local bdom = getdomain(b)
-		local ab = util.string.split(adom)
-		local bb = util.string.split(bdom)
+		local ab = util.string.split(getdomain(a), "%.")
+		local bb = util.string.split(getdomain(b), "%.")
 		local needed_match = ( (#ab > #bb) and #ab) or #bb
-		if matching > needed_match then
+		if matching >= needed_match then
 			return true
 		end
 	end
@@ -203,9 +202,21 @@ local islisted = function (host, rhost, typ, party)
 		else
 			n = #host_bits
 		end
-		-- Make list to match rhost against
-		local list = rpdb:exec(string.format("SELECT * FROM tp_%slist WHERE domain = %s;", typ, sql_escape("all")))
-		local tlist = exlist.third.white["all"]
+		local list, tlist
+		-- Make list to match rhost against, use cache if valid
+		if cache[host] and cache[host][typ] then
+			list = cache[host][typ]
+			if typ == "white" then
+				tlist = exlist.third.white["all"]
+				repeat
+					tlist = util.table.join(tlist, exlist.third.white[phost] or {})
+					phost = (host_bits[n] or "").. "." .. phost
+					n = n + 1
+				until n > #host_bits + 1
+			end
+		else
+			list = rpdb:exec(string.format("SELECT * FROM tp_%slist WHERE domain = %s;", typ, sql_escape("all")))
+			tlist = exlist.third.white["all"]
 			repeat
 				local rows = rpdb:exec(string.format("SELECT * FROM tp_%slist WHERE domain = %s;", typ, sql_escape(phost)))
 				list = util.table.join(list, rows or {})
@@ -215,22 +226,34 @@ local islisted = function (host, rhost, typ, party)
 				phost = (host_bits[n] or "").. "." .. phost
 				n = n + 1
 			until n > #host_bits + 1
-			for _,v in pairs(list) do
-				if subdomainmatch(v.rdomain, rhost) or v.rdomain == "all" then
+			-- Save list in cache
+			if not cache[host] then cache[host] = {} end
+			cache[host][typ] = list
+		end
+		-- Match vs lists
+		for _,v in pairs(list) do
+			if subdomainmatch(v.rdomain, rhost) or v.rdomain == "all" then
+				return true
+			end
+		end
+		-- Only check exceptions if checking a whitelist
+		if typ == "white" then
+			for k,v in pairs(tlist) do
+				if subdomainmatch(v, rhost) or v == "all" then
 					return true
 				end
 			end
-			-- Only check exceptions if checking a whitelist
-			if typ == "white" then
-				for k,v in pairs(tlist) do
-					if subdomainmatch(v, rhost) or v == "all" then
-						return true
-					end
-				end
-			end
+		end
 		return false
 	else
-		local list = rpdb:exec(string.format("SELECT * FROM %slist;", typ))
+		local list
+		if cache[typ] then
+			list = cache[typ]
+		else
+			list = rpdb:exec(string.format("SELECT * FROM %slist;", typ))
+			cache[typ] = list
+		end
+
 		for _,v in pairs(list) do
 			if subdomainmatch(v.domain, rhost) then
 				return true;
@@ -266,33 +289,34 @@ local checkpolicy = function (host, requested, nav, firstnav)
 	if not requested then
 		return DENIED.BLACKLIST
 	end
-
 	-- Should always accept these
 	if string.match(requested, "about:blank") or filtering.acceptall then
 		return ACCEPT
 	end
-
 	-- Get host from requested uri and file-type extension
 	local rpuri = lousy.uri.parse(requested)
 	local req = { host = string.lower(rpuri and rpuri.host or ""), ftype = getextension(requested) }
-
 	-- webview.uri is nil for the first requests when loading a page (they are always first party)	
 	local puri = lousy.uri.parse(host or "")
 	host = puri and puri.host or req.host
 
-	-- Blacklisting overrides whitelist
-	if islisted(nil, req.host, "black", ANY_PARTY) then
-		return DENIED.BLACKLIST
-	end
+	local wlisted = false
+	-- Skip checks for data: uris - they would be covered by the policies of whatever they were embedded in
+	if not string.match(requested, "^data:") then
+		-- Blacklisting overrides whitelist
+		if islisted(nil, req.host, "black", ANY_PARTY) then
+			return DENIED.BLACKLIST
+		end
 	
-	-- Check if requested domain is whitelisted
-	local wlisted = islisted(nil, req.host, "white", ANY_PARTY)
+		-- Check if requested domain is whitelisted
+		wlisted = islisted(nil, req.host, "white", ANY_PARTY)
 
-	-- Whitelisting overrides AdBlocking/Pattern Block
-	if not wlisted and filtering.adblock then
-		-- If AdBlock / Pattern matching is enabled, check if requested uri matches and should be blocked
-		if patternMatch(requested) then
-			return DENIED.ADBLOCK
+		-- Whitelisting overrides AdBlocking/Pattern Block
+		if not wlisted and filtering.adblock then
+			-- If AdBlock / Pattern matching is enabled, check if requested uri matches and should be blocked
+			if patternMatch(requested) then
+				return DENIED.ADBLOCK
+			end
 		end
 	end
 
@@ -326,7 +350,7 @@ local concatRes = function (l, uri, r)
 		if puri and puri.host then
 			-- If the host doesn't have a table yet, add it
 			if not l[puri.host] then
-				l[puri.host] = { accept = 0, deny = 0 , reasons = {} }
+				l[puri.host] = {accept = 0, deny = 0, reasons = {}}
 			end
 			-- Increment counter (s)
 			if not r then
@@ -338,30 +362,6 @@ local concatRes = function (l, uri, r)
 			end
 		end
 	end
-end
-
-
--- XXX For Debugging only, REMOVE
-local filterDEBUG = function (main_uri, request, nav, po, first)
-	local puri = lousy.uri.parse(main_uri or "")
-	local host = puri and puri.host or "NONE"
-	pdebug("policy: %s request made by %s", nav and "navigation" or "resource", host or "NONE")
-
-	if not po then
-		pdebug("policy: accepted request for '%s'", request)
-	elseif po == DENIED.BLACKLIST then
-		pdebug("policy: denied request [Blacklisted Domain] for '%s'", request)
-	elseif po == DENIED.ADBLOCK then
-		pdebug("policy: denied request [Pattern Match] for '%s'", request)
-	elseif po == DENIED.NO_WHITELIST then
-		pdebug("policy: denied request [Non-Whitelisted CDR] for '%s'", request)
-	elseif po == DENIED.BLACKLIST_TP then
-		pdebug("policy: denied request [Blacklisted CDR] for '%s'", request)
-	elseif po == DENIED.BLOCKED_TYPE then
-		pdebug("policy: denied request [Blocked File-type] for '%s'", request)
-	else
-		pdebug("policy: denied request [Unknown Reason] for '%s'", request)	
-	end 
 end
 
 -- Connect signals to all webview widgets on creation
@@ -388,11 +388,10 @@ webview.init_funcs.policu_signals = function (view, w)
 						elseif r == DENIED.BLACKLIST then
 							w:error("Policy: Blacklisted domain '" .. uri .. "'")
 						end
-						-- Hack to get luakit;// pages to load
+						-- Hack to get luakit:// pages to load
 						local puri = lousy.uri.parse(uri or "")
 						if puri and puri.scheme == "luakit" then
 						else
-							-- remember, accept = 0
 							return not r
 						end				
 					end)
@@ -410,11 +409,11 @@ webview.init_funcs.policu_signals = function (view, w)
 						navto[v].first = false
 						-- Add the request to the request table
 						concatRes(navto[v].res, uri, r)
+
 						-- Hack to get luakit;// pages to load
 						local puri = lousy.uri.parse(uri or "")
 						if puri and puri.scheme == "luakit" then
 						else
-							--remember, accept = 0
 							return not r
 						end
 					end)
@@ -454,6 +453,7 @@ local togglestrings = {
 	requestpolicy = "cross-domain request policy blocking.",
 	typepolicy = "cross-domain file-type blocking",
 	strictsubdomain = "strict matching for subdomains.",
+	widget = "visibility of status widget.",
 }
 
 local rp_setting = function (field, value, w)
@@ -472,229 +472,201 @@ local rp_setting = function (field, value, w)
 	return togglestrings[field] and true
 end
 
--- Add A host to the temporary exceptions table
-local add_ab_exception = function(host, w)
-	if not util.table.hasitem(exlist.white or {}, host) then
-		table.insert(exlist.white, host)
-		w:notify("Added an exception for '".. host .. "'")
-	else
-		w:error("Policy: '" .. host .. "' was already granted an exception.")
-	end
-end
-
-local del_ab_exception = function(host, w)
-	local i = util.table.hasitem(exlist.white or {}, host)
-	if i then
-		table.remove(exlist.white, i)
-		w:notify("Removed exception for '".. host .. "'")
-	else
-		w:error("Policy: '" .. host .. "' had not been granted an exception.")
-	end
-end
-
-local add_tp_exception = function(host, rhost, w)
-	-- If host doesn't have a exception list entry, make an empty one
-	if not exlist.third.white[host] then
-		exlist.third.white[host] = {}
-	end
-	if not util.table.hasitem(exlist.third.white[host], rhost) then
-		table.insert(exlist.third.white[host], rhost)
-		w:notify("Added an exception for requests from '".. host .. "' to '" .. rhost .. "'")
-	else
-		w:error("Policy: '" .. rhost .. "' was already granted an exception.")
-	end
-end
-
-local del_tp_exception = function(host, rhost, w)
-	if exlist.third.white[host] then
-		local i =  util.table.hasitem(exlist.third.white[host] or {}, rhost) 
-		if i then
-			table.remove(exlist.third.white[host], i)
-			w:notify("Removed exception for requests from '".. host .. "' to '" .. rhost .. "'")
-			return
+-- Clears Excption lists and returns the number of items they contained
+local clear_exlist = function ()
+	local listlen = #exlist.white
+	for _,v in pairs(exlist.third.white) do
+		for _,_ in pairs(v) do
+			listlen = listlen + 1
 		end
 	end
-	w:error("Policy: '" .. host .. " - " .. rhost .."' had not been granted an exception.")
+	exlist.white = {}
+	exlist.third.white = {}
+	return listlen or 0
 end
 
--- Add host to domain white or black list
-local add_list = function (host, typ, w)
-	local row = rpdb:exec(string.format(sql_format.match_list, typ, sql_escape(host)))
-	if row and row[1] then
-		w:error("Policy: '" .. host .. "' is already " .. typ .. "listed")
+-- Returns true if entery exists
+local checkList = function (typ, hosts)
+	local host = hosts[1]
+	local rhost = hosts[2]
+	if rhost then
+		if typ == "ex" then
+			return exlist.third.white[host] and util.table.hasitem(exlist.third.white[host], rhost) and true	
+		elseif typ == "white" or typ == "black" then
+			local row = rpdb:exec(string.format(sql_format.match_tp_list, typ, sql_escape(host), sql_escape(rhost)))
+			return row and row[1] and true	
+		end
 	else
-		rpdb:exec(string.format(sql_format.add_list, typ, sql_escape(host)))
-		w:notify("Added '".. host .. "' to " .. typ .."list")
+		if typ == "ex" then
+			return util.table.hasitem(exlist.white, host) and true
+		elseif typ == "white" or typ == "black" then
+			local row = rpdb:exec(string.format(sql_format.match_list, typ, sql_escape(host)))
+			return row and row[1] and true
+		end
 	end
 end
 
-local add_tp_list = function (host, rhost, typ, w)
-	local row = rpdb:exec(string.format(sql_format.match_tp_list, typ, sql_escape(host), sql_escape(rhost)))
-	if row and row[1] then
-		w:error("Policy: '" .. host .. " - " .. rhost .. "' is already " .. typ .. "listed")
+
+-- Return Strings, makes localization easier
+local retStr = {
+	sucess = {
+		add = {
+			one = {
+				ex = "Exception added for %s",
+				white = "Added %s to whitelist",
+				black = "Added %s to blacklist"},
+			mul = {
+				ex = "Exception added for requests from %s to %s",
+				white = "Whitelisted requests from %s made to %s",
+				black = "Blacklisted requests from %s made to %s"},
+		},
+		del = {
+			one = {
+				ex = "Removed exception for %s",
+				white = "Removed %s from whitelist",
+				black = "Removed %s from blacklist"},
+			mul = {
+				ex = "Exception removed for requests from %s to %s",
+				white = "Removed whitelisting of requests from %s to %s",
+				black = "Removed blacklisting of requests from %s to %s"},
+		},
+	},
+	failure = {
+		add = {
+			one = {
+				ex = "Exception had already been granted to %s!",
+				white = "%s was already whitelisted!",
+				black = "%s was already blacklisted!"},
+			mul = {
+				ex = "Exception had already been granted to requests from %s to %s!",
+				white = "Requests from %s to %s were already whitelisted!",
+				black = "Requests from %s to %s were already blacklisted!"},
+		},
+		del = {
+			one = {
+				ex = "Exception had not been granted to %s!",
+				white = "%s was not whitelisted!",
+				black = "%s was not blacklsited!"},
+			mul = {
+				ex = "Requests from %s to %s had not been granted an exception!",
+				white = "Requests from %s to %s were not whitelisted!",
+				black = "Requests from %s to %s were not blacklisted!"},
+		},
+}} -- end retStr
+
+local modList = function (cmd, typ, hosts, w)
+	local host = hosts[1]
+	local rhost = hosts[2]
+	local listed = checkList(typ, hosts)
+	local num = (rhost and "mul") or "one"
+	local suc = "failure"
+	if cmd == "add" then
+		if not listed then
+			if rhost then
+				if typ == "white" or typ == "black" then
+					rpdb:exec(string.format(sql_format.add_tp_list, 
+					                        typ, sql_escape(host), sql_escape(rhost)))
+				else
+					if not exlist.third.white[host] then
+						exlist.third.white[host] = {}
+					end
+					table.insert(exlist.third.white[host], rhost)
+				end
+			else
+				if typ == "white"  or typ == "black" then
+					rpdb:exec(string.format(sql_format.add_list, typ, sql_escape(host)))
+				else
+					table.insert(exlist.white, host)
+				end
+			end
+			suc = "sucess"
+		end
+	elseif cmd == "del" then
+		if listed then
+			if rhost then
+				if typ == "white" or typ == "black" then
+					rpdb:exec(string.format(sql_format.remove_tp_list_exact,
+					                        typ, sql_escape(host), sql_escape(rhost)))
+				else
+					local i = util.table.hasitem(exlist.third.white[host] or {}, rhost)
+					if i then table.remove(exlist.third.white[host], i) end
+				end
+			else
+				if typ == "white" or typ == "black" then
+					rpdb:exec(string.format(sql_format.remove_list, typ, sql_escape(host)))
+				else
+					local i = util.table.hasitem(exlist.white, host)
+					if i then table.remove(exlist.white, i) end
+				end
+			end
+			suc = "sucess"
+		end
+	end
+	-- Feedback on sucess/failure
+	if suc == "sucess" then
+		-- Changed [typ]-list, clear cache
+		cache = {}
+		w:notify(string.format(retStr[suc][cmd][num][typ], host or "", rhost or ""))
 	else
-		rpdb:exec(string.format(sql_format.add_tp_list, typ, sql_escape(host), sql_escape(rhost)))
-		w:notify("Added '".. host .. " - " .. rhost .."' to " .. typ .."list")
+		w:error(string.format(retStr[suc][cmd][num][typ], host or "", rhost or ""))
 	end
 end
-
--- Remove host from domain white or black list
-local del_list = function(host, typ, w)
-	local row = rpdb:exec(string.format(sql_format.match_list, typ, sql_escape(host)))
-	if row and row[1] then
-		rpdb:exec(string.format(sql_format.remove_list, typ, sql_escape(host)))
-		w:notify("Removed '".. host .. "' from " .. typ .."list")
-	else
-		w:error("Policy: '" .. host .. "' was not " .. typ .. "listed")
-	end
-end
-
-local del_tp_list = function (host, rhost, typ, w)
-	local row = rpdb:exec(string.format(sql_format.match_tp_list, typ, sql_escape(host), sql_escape(rhost)))
-	if row and row[1] then
-		rpdb:exec(string.format(sql_format.remove_tp_list_exact, typ, sql_escape(host), sql_escape(rhost)))
-		w:notify("Removed '".. host .. " - " .. rhost .."' from " .. typ .."list")
-	else
-		w:error("Policy: '" .. host .. " - " .. rhost .. "' was not " .. typ .. "listed")
-	end
-end
-
 
 -- Master user commands parser
 local rp_command = function(command, w, a)
 	a = string.lower(a or "")
 	local args = util.string.split(util.string.strip(a or ""), " ")
-	-- Attempt to get a host/rhost out of args
-	local host  = args[1] and ((args[1] == "all" and "all") or (lousy.uri.parse(args[1]) or {}).host)
-	local rhost = args[2] and ((args[2] == "all" and "all") or (lousy.uri.parse(args[2]) or {}).host)
 
-	--TODO add host/rhost cheking vs public suffixes with getdomain()
-		if command == "wl" or command == "whitelist" then
-			if #args == 1 then
-				if host then
-					add_list(host, "white", w)
-				else
-					w:error("Policy: wl, Bad argument error. (" .. host .. ")")	
-				end
-			elseif #args == 2 then
-				if host and rhost then
-					add_tp_list(host, rhost, "white", w)
-				else
-					w:error("Policy: wl, Bad argument error. (" .. host .. ")")	
-				end
-			else
-				w:error("Policy: wl, Wrong number of arguments!")
-			end
-		elseif command == "bl" or comamnd == "blacklist" then
-			if #args == 1 then
-				if host then
-					add_list(host, "black", w)
-				else
-					w:error("Bad argument error. (" .. host .. ", " .. rhost ..")")	
-				end
-			elseif #args == 2 then
-				if host and rhost then
-					add_tp_list(host, rhost, "black", w)
-				else
-					w:error("Bad argument error. (" .. host .. ", " .. rhost ..")")	
-				end
-			else
-				w:error("Wrong number of arguments!")
-			end
-
-		elseif command == "ex" or command == "exception" then
-			if #args == 1 then
-				if host then
-					add_ab_exception(host, w)
-				else
-					w:error("Bad argument error. (" .. host .. ")")	
-				end
-			elseif #args == 2 then
-				if host and rhost then
-					add_tp_exception(host, rhost, w)
-				else
-					w:error("Bad argument error. (" .. host .. ", " .. rhost ..")")	
-				end
-			else
-				w:error("Wrong number of arguments!")
-			end
-		elseif command == "wl!" or command == "whitelist!" then
-			if #args == 1 then
-				if host then
-					del_list(host, "white", w)
-				else
-					w:error("Bad argument error. (" .. host .. ")")	
-				end
-			elseif #args == 2 then
-				if host and rhost then
-					del_tp_list(host, rhost, "white", w)
-				else
-					w:error("Bad argument error. (" .. host .. ", " .. rhost ..")")	
-				end
-			else
-				w:error("Wrong number of arguments!")
-			end
-			-- Remove 
-		elseif command == "bl!" or command == "blacklist!" then
-			if #args == 1 then
-				if host then
-					del_list(host, "black", w)
-				else
-					w:error("Bad argument error. (" .. host .. ")")	
-				end
-			elseif #args == 2 then
-				if host and rhost then
-					del_tp_list(host, rhost, "black", w)
-				else
-					w:error("Bad argument error. (" .. host .. ", " .. rhost ..")")	
-				end
-			else
-				w:error("Wrong number of arguments!")
-			end
-		elseif command == "ex!" or command == "exception!" then
-			if #args == 1 then
-				if host then
-					del_ab_exception(host, w)
-				else
-					w:error("Bad argument error. (" .. host .. ")")	
-				end
-			elseif #args == 2 then
-				if host and rhost then
-					del_tp_exception(host, rhost, w)
-				else
-					w:error("Bad argument error. (" .. host .. ", " .. rhost ..")")	
-				end
-			else
-				w:error("Wrong number of arguments!")
-			end
-
-		elseif command == "wl!!" or command == "whitelist!!" or
-			   command == "wl-removeall" or command == "whitelist-removeall" then
-
-		elseif command == "bl!!" or command == "blacklist!!" or
-			   command == "bl-removeall" or command == "blacklist-removeall" then
-
-		elseif command == "set" then
+	if command == "set" then
 		-- Set request policy behaviors
-			local val = not string.match(args[1], "!$")
-			local set = string.match(args[1], "(.*)!$") or args[1]
-			if not rp_setting(set, val, w) then
-				w:error("Policy: set '" .. args[1] .. "' is not a valid setting. (adblock[!], requestpolicy[!], typepolicy[!], acceptall[!], strictsubdomain[!])")
+		local val = not string.match(args[1], "!$")
+		local set = string.match(args[1], "(.*)!$") or args[1]
+		if not rp_setting(set, val, w) then
+			w:error("Policy: set '" .. args[1] .. "' is not a valid setting. (adblock[!], requestpolicy[!], typepolicy[!], acceptall[!], strictsubdomain[!])")
+		end
+	elseif command == "clear" then
+		w:notify(string.format("Removed %d policy exceptions.", clear_exlist()))
+	else
+		-- else it's wl/bl/ex and args will be hosts and require special parsing
+		if #args == 0 or #args > 2 then
+			w:error("Policy: Wrong number of arguments!")
+			return
+		end
+		-- Attempt to get a host/rhost out of args
+		local host  = args[1] and ((args[1] == "all" and "all") or (lousy.uri.parse(args[1]) or {}).host)
+		local rhost = args[2] and ((args[2] == "all" and "all") or (lousy.uri.parse(args[2]) or {}).host)
+
+		-- Convert empty rhost to nil
+		if rhost == "" then rhost = nil end
+		--TODO add host/rhost cheking vs public suffixes with getdomain()
+		if #args == 1 then
+			if not host then
+				w:error("Bad argument error. (" .. host .. ")")
+				return
 			end
-		elseif command == "clear" then
-			-- Clear temp tables
-			local listlen = #exlist.white
-			for _,v in pairs(exlist.third.white) do
-				for _,_ in pairs(v) do
-					listlen = listlen + 1
-				end
+		else
+			if not host or not rhost then
+				w:error("Bad argument error. (" .. host .. ", " .. rhost ..")")
+				return
 			end
-			exlist.white = {}
-			exlist.third.white = {}
-			w:notify(string.format("Removed %d policy exceptions.", listlen))
+		end
+
+		if command == "wl" or command == "whitelist" then
+			modList("add", "white", {host, rhost}, w)
+		elseif command == "bl" or comamnd == "blacklist" then
+			modList("add", "black", {host, rhost}, w)
+		elseif command == "ex" or command == "exception" then
+			modList("add", "ex", {host, rhost}, w)
+		elseif command == "wl!" or command == "whitelist!" then
+			modList("del", "white", {host, rhost}, w)
+		elseif command == "bl!" or command == "blacklist!" then
+			modList("del", "black", {host, rhost}, w)
+		elseif command == "ex!" or command == "exception!" then
+			modList("del", "ex", {host, rhost}, w)
 		else
 			w:error("Policy: '" .. command .. "' is not a valid request policy command!")
 		end
+	end
 end
 
 -- Add commands ===============================================================
@@ -718,6 +690,7 @@ new_mode("policymenu", {
 				reasons = reasons .. (k and " ") .. k
 			end
 			local notcdr = domainmatch(main, host)
+			-- Underline the main domain of the host
 			local domain = string.gsub(getdomain(host), "[%.%-]", "%%%1")
 			local formhost = string.gsub(host, domain, "<u>" .. domain .. "</u>")
 			if host == main then
@@ -750,168 +723,100 @@ new_mode("policymenu", {
     end,
 })
 
+local genLine = function ( fmt, cFmt, cm, h, rh, ifg, ibg)
+	return {string.format(fmt, h, rh),
+			string.format(cFmt, cm, h, rh), 
+	        host = h, rhost = rh, cmd = cm,
+			fg = ifg, bg = ibg}
+end
+
 new_mode("policysubmenu", {
     enter = function (w)
-        local afg = theme.rpolicy_active_menu_fg or theme.proxy_active_menu_fg
-        local ifg = theme.rpolicy_inactive_menu_fg or theme.proxy_inactive_menu_fg
-        local abg = theme.rpolicy_active_menu_bg or theme.proxy_active_menu_bg
-        local ibg = theme.rpolicy_inactive_menu_bg or theme.proxy_inactive_menu_bg
+        local ifg = theme.rpolicy_inactive_menu_fg or theme.inactive_menu_fg
+        local ibg = theme.rpolicy_inactive_menu_bg or theme.inactive_menu_bg
 		local host = navto[w.view].selectedhost or "REQ_HOST"
 		local main = (lousy.uri.parse(w.view.uri or "") or {}).host or "HOST"
         local rows = {{ "Actions for " .. host , "Command", title = true }}
-
-		-- plain whitelist/blacklist
-		if (rpdb:exec(string.format(sql_format.match_list, "white", sql_escape(host))) or {})[1] then
-			table.insert(rows,
-					  { "Remove " .. host .. " from whitelist",
-					   " :rp wl! " .. host,
-					   host = host, main = main, cmd = "wl!",
-					   fg = ifg, bg = ibg })
+	-- Any host
+		if checkList("white", {host, nil}) then
+			table.insert(rows, genLine("Remove %s from whitelist", " :rp %s %s", "wl!", host, nil, ifg, ibg))
 		else
-			table.insert(rows,
-					  { "Add " .. host .. " to whitelist",
-					   " :rp wl " .. host,
-					   host = host, main = main, cmd = "wl",
-					   fg = ifg, bg = ibg })
-		end
-		if (rpdb:exec(string.format(sql_format.match_list, "black", sql_escape(host))) or {})[1] then
-			table.insert(rows,
-					  { "Remove " .. host .. " from blacklist",
-					   " :rp bl! " .. host,
-					   host = host, main = main, cmd = "bl!",
-					   fg = ifg, bg = ibg })
-		else
-			table.insert(rows,
-					  { "Add " .. host .. " to blacklist",
-					   " :rp bl " .. host,
-					   host = host, main = main, cmd = "bl",
-					   fg = ifg, bg = ibg })
+			table.insert(rows, genLine("Add %s to whitelist", " :rp %s %s", "wl", host, nil, ifg, ibg))
 		end
 
-	-- Sud-menu for the page's domain
-	if host == main then
-		if (rpdb:exec(string.format(sql_format.match_tp_list, "white", sql_escape("all"), sql_escape(host))) or {})[1] then
-			table.insert(rows,
-					  { "Revoke complete CDRs whitelisting from " .. main,
-					   " :rp wl! " .. main .. " ALL",
-					   host = "all", main = main, cmd = "wl!",
-					   fg = ifg, bg = ibg })
+		if checkList("black", {host, nil}) then
+			table.insert(rows, genLine("Remove %s from blacklist", " :rp %s %s", "bl!", host, nil, ifg, ibg))
 		else
-			table.insert(rows,
-					  { "Allow all CDRs from " .. main,
-					   " :rp wl " .. main .. " ALL",
-					   host = "all", main = main, cmd = "wl",
-					   fg = ifg, bg = ibg })
+			table.insert(rows, genLine("Add %s to blacklist", " :rp %s %s", "bl", host, nil, ifg, ibg))
 		end
-		if (rpdb:exec(string.format(sql_format.match_tp_list, "black", sql_escape("all"), sql_escape(host))) or {})[1] then
-			table.insert(rows,
-					  { "Remove complete CDR blacklisting from " .. main,
-					   " :rp bl! " .. main .. " ALL",
-					   host = "all", main = main, cmd = "bl!",
-					   fg = ifg, bg = ibg })
+
+		if checkList("ex", {host, nil}) then
+			table.insert(rows, genLine("Revoke exception for %s", " :rp %s %s", "ex!", host, nil, ifg, ibg))
 		else
-			table.insert(rows,
-					  { "Blacklist all CDRs for " .. main,
-					   " :rp bl " .. main .. " ALL",
-					   host = "all", main = main, cmd = "bl",
-					   fg = ifg, bg = ibg })
+			table.insert(rows, genLine("Grant an exception for %s", " :rp %s %s", "ex", host, nil, ifg, ibg))
 		end
-		if util.table.hasitem(exlist.white or {}, main) then
-			table.insert(rows,
-					  { "Remove temporarily whitelisting of " .. main,
-					   " :rp ex! " .. main,
-					   host = host, main = main, cmd = "ex!",
-					   fg = ifg, bg = ibg })
+
+	-- For main host
+		if host == main then
+			if checkList("white", {host, "all"}) then
+				table.insert(rows, genLine("Revoke complete CDR whitelisting from %s", " :rp %s %s %s", "wl!", host, "ALL", ifg, ibg))
+			else
+				table.insert(rows, genLine("Allow all CDRs from %s", " :rp %s %s %s", "wl", host, "ALL", ifg, ibg))
+			end
+
+			if checkList("black", {host, "all"}) then
+				table.insert(rows, genLine("Revoke complete CDR blacklisting from %s", " :rp %s %s %s", "bl!", host, "ALL", ifg, ibg))
+			else
+				table.insert(rows, genLine("Deny all CDRs from %s", " :rp %s %s %s", "bl", host, "ALL", ifg, ibg))
+			end
+
+			if checkList("ex", {host, "all"}) then
+				table.insert(rows, genLine("Revoke complete CDR exception from %s", " :rp %s %s %s", "ex!", host, "ALL", ifg, ibg))
+			else
+				table.insert(rows, genLine("Grant an excpetion for all CDRs from %s", " :rp %s %s %s", "ex", host, "ALL", ifg, ibg))
+			end
+
+	-- For other hosts
 		else
-			table.insert(rows,
-					  { "Temporarily whitelist " .. main,
-					   " :rp ex " .. main,
-					   host = host, main = main, cmd = "ex",
-					   fg = ifg, bg = ibg })
+			if checkList("white", {main, host}) then
+				table.insert(rows, genLine("Revoke whitelisting of CDRs from %s to %s", " :rp %s %s %s", "wl!", main, host, ifg, ibg))
+			else
+				table.insert(rows, genLine("Allow CDRs from %s to %s", " :rp %s %s %s", "wl", main, host, ifg, ibg))
+			end
+
+			if checkList("black", {main, host}) then
+				table.insert(rows, genLine("Revoke whitelisting of CDRs from %s to %s", " :rp %s %s %s", "bl!", main, host, ifg, ibg))
+			else
+				table.insert(rows, genLine("Deny CDRs from %s to %s", " :rp %s %s %s", "bl", main, host, ifg, ibg))
+			end
+
+			if checkList("white", {"all", host}) then
+				table.insert(rows, genLine("Revoke whitelisting of CDRs from %s to %s", " :rp %s %s %s", "wl!", "ALL", host, ifg, ibg))
+			else
+				table.insert(rows, genLine("Allow CDRs from %s to %s", " :rp %s %s %s", "wl", "ALL", host, ifg, ibg))
+			end
+
+			if checkList("black", {"all", host}) then
+				table.insert(rows, genLine("Revoke whitelisting of CDRs from %s to %s", " :rp %s %s %s", "bl!", "ALL", host, ifg, ibg))
+			else
+				table.insert(rows, genLine("Deny CDRs from %s to %s", " :rp %s %s %s", "bl", "ALL", host, ifg, ibg))
+			end
+
+			if checkList("ex", {main, host}) then
+				table.insert(rows, genLine("Revoke exception for CDRs from %s to %s", " :rp %s %s %s", "ex!", main, host, ifg, ibg))
+			else
+				table.insert(rows, genLine("Grant an excpetion for CDRs from %s to %s", " :rp %s %s %s", "ex", main, host, ifg, ibg))
+			end
+
+			if checkList("ex", {"all", host}) then
+				table.insert(rows, genLine("Revoke exception for CDRs from %s to %s", " :rp %s %s %s", "ex!", "ALL", host, ifg, ibg))
+			else
+				table.insert(rows, genLine("Grant an excpetion for CDRs from %s to %s", " :rp %s %s %s", "ex", "ALL", host, ifg, ibg))
+			end
 		end
-		if exlist.third.white[main] then
-			--TODO remove temp tp whitelist all CDR
-		else
-			table.insert(rows,
-					  { "Temporarily allow all CDRs from " .. main,
-					   " :rp ex " .. main .. " ALL", 
-					   host = "all", main = main, cmd = "ex",
-					   fg = ifg, bg = ibg })
-		end
-	else
-		if (rpdb:exec(string.format(sql_format.match_tp_list, "white", sql_escape(main), sql_escape(host))) or {})[1]then
-			table.insert(rows,
-					  { "Revoke the CDR whitelisting for this host from " .. main,
-					   " :rp wl! " .. main .. " " .. host, 
-					   host = host, main = main, cmd = "wl!",
-					   fg = ifg, bg = ibg })
-		else
-			table.insert(rows,
-					  { "Allow CDRs to this host from " .. main,
-					   " :rp wl " .. main .. " " .. host, 
-					   host = host, main = main, cmd = "wl",
-					   fg = ifg, bg = ibg })
-		end
-		if (rpdb:exec(string.format(sql_format.match_tp_list, "black", sql_escape(main), sql_escape(host))) or {})[1]then
-			table.insert(rows,
-					  { "Remove the CDR blacklisting for this host from " .. main,
-					   " :rp bl! " .. main .. " " .. host, 
-					   host = host, main = main, cmd = "bl!",
-					   fg = ifg, bg = ibg })
-		else
-			table.insert(rows,
-					  { "Blacklist CDRs to this host from " .. main,
-					   " :rp bl " .. main .. " " .. host, 
-					   host = host, main = main, cmd = "bl",
-					   fg = ifg, bg = ibg })
-		end
-		if (rpdb:exec(string.format(sql_format.match_tp_list, "white", sql_escape(main), sql_escape("all"))) or {})[1] then
-			table.insert(rows,
-					  { "Remove the CDR whitelisting for this host from all domains",
-					   " :rp wl! all " .. host, 
-					   host = host, main = "all", cmd = "wl!",
-					   fg = ifg, bg = ibg })
-		else
-			table.insert(rows,
-					  { "Allow CDRs to this host from all domains",
-					  " :rp wl ALL " .. host, 
-					   host = host, main = "all", cmd = "wl",
-					   fg = ifg, bg = ibg })
-		end
-		if (rpdb:exec(string.format(sql_format.match_tp_list, "black", sql_escape(main), sql_escape("all"))) or {})[1]then
-			table.insert(rows,
-					  { "Remove the CDR blacklisting for this host from all domains",
-					   " :rp bl! all " .. host, 
-					   host = host, main = "all", cmd = "bl!",
-					   fg = ifg, bg = ibg })
-		else
-			table.insert(rows,
-					  { "Blacklist CDRs to this host from all domains",
-					  " :rp bl ALL " .. host, 
-					   host = host, main = "all", cmd = "bl",
-					   fg = ifg, bg = ibg })
-		end
-		if util.table.hasitem(exlist.third.white[main] or {}, host) then
-			-- TODO remove temp wl
-		else
-			table.insert(rows,
-					  { "Temporarily allow CDRs to this host from " .. main,
-					   " :rp ex " .. main .. " " .. host, 
-					   host = host, main = main, cmd = "ex",
-					   fg = ifg, bg = ibg })
-		end
-		if util.table.hasitem(exlist.third.white["all"] or {}, host) then
-			-- TODO remove temp wl
-		else
-			table.insert(rows,
-					  { "Temporarily allow CDRs to this host from all domains",
-					   " :rp ex ALL " .. host, 
-					   host = host, main = main, cmd = "ex",
-					   fg = ifg, bg = ibg })
-		end
-	end
+	
         w.menu:build(rows)
-        w:notify("Use j/k to move, Select action wish to take and press Enter or q to exit.", false)
+        w:notify("Use j/k to move, Enter to execute action, S-Enter to edit command, or q to exit.", false)
     end,
 
     leave = function (w)
@@ -931,20 +836,18 @@ add_binds("policymenu", lousy.util.table.join({
     	        w:set_mode("policysubmenu")
 			end
 		end),
-
-	-- TODO add in shortcut keys for commands
     -- Exit menu
     key({}, "q", function (w) w:set_mode() end),
 
 }, menu_binds))
 
 add_binds("policysubmenu", lousy.util.table.join({
-	-- TODO make return just do the command, and Shift-Return put it in the input bar
 	key({}, "Return",
         function (w)
 			local row = w.menu:get()
-            if row and row[2] then
-                w:enter_cmd(util.string.strip(row[2]))
+			if row and row.cmd then
+				w:set_mode()
+				rp_command(row.cmd, w, (row.host or "") .. " " .. (row.rhost or ""))
             end
         end),
 	key({"Shift"}, "Return",
@@ -981,7 +884,7 @@ add_cmds({
 		function(w, a, o)
 			rp_command((o.bang and "bl!") or "bl", w, a)
 		end),
-	cmd({"rp-exempt", "rp-ex"}, "grant temporary exceptions to request polices",
+	cmd({"rp-exception", "rp-ex"}, "grant temporary exceptions to request polices",
 		function(w, a, o)
 			rp_command((o.bang and "ex!") or "ex", w, a)
 		end),
@@ -1010,7 +913,6 @@ add_binds("normal", {
 })
 
 -- Status Bar Widget ==========================================================
---[[
 -- Create the indictor widget on window creation
 window.init_funcs.build_policy_indicator = function(w)
 	local i = w.sbar.r
@@ -1029,25 +931,39 @@ end
 -- Update indicator on page navigation
 webview.init_funcs.policy_update = function(view, w)
 	view:add_signal("load-status", function (v, status)
-		if status == "committed" or status == "failed" or status == "finished" then
-			w:update_policy()
+		if status == "committed" or status == "provisional" then
+			w:update_policy(false)
+		elseif status == "failed" or status == "finished" then
+			w:update_policy(true)
 		end
 	end)
 end
 
 -- Update contents of request policy widget
-window.methods.update_policy = function(w)
+window.methods.update_policy = function(w, fin)
 	if not w.view then return end
-    local pw = w.sbar.r.policy
-	local text = "["
-	if not filtering.acceptall then
-		text = text .. "rp"
+	local pw = w.sbar.r.policy
+	if filtering.widget then
+		local text
+		if not fin then
+			text = "[Loading...]"
+		else
+			text = "["
+			if navto[w.view].res then
+				local acc, rej = 0, 0
+				for _,pol in pairs(navto[w.view].res) do
+					acc = acc + pol.accept
+					rej = rej + pol.deny
+				end
+				text = text .. string.format("<span foreground=\"#0f0\">A%d</span> <span foreground=\"#f00\">B%d</span>", acc, rej)
+			end
+			text = text .. "]"
+		end
+		pw.text = text
+		pw:show()
 	else
-		text = text .. "aa"
+		pw:hide()
 	end
-	pw.text = text .. "]"
-	pw:show()
 end
-]]
 -- Call load()
 load()
