@@ -40,7 +40,7 @@ local tld = require("tld")
 local getdomain = tld.getdomain
 
 -- Calls modifed adblock
-local adblock = require("plugins.adblock")
+--local adblock = require("plugins.adblock")
 
 module("plugins.policy")
 
