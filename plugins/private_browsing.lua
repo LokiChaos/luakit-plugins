@@ -12,8 +12,11 @@ local theme = theme
 local luakit = luakit
 local domain_props = domain_props
 local lousy = require("lousy")
+local util = lousy.util
 local history = require("history")
+local nohist = globals.history_blacklist or {}
 
+local print = print
 module("plugins.private_browsing")
 
 local indicator = { private = "!hist", notprivate = "" }
@@ -22,7 +25,6 @@ local indicator = { private = "!hist", notprivate = "" }
 theme.pbm_font = theme.pbm_font or theme.buf_sbar_font
 theme.pbm_fg   = theme.pbm_fg   or theme.buf_sbar_fg
 theme.pbm_bg   = theme.pbm_bg   or theme.buf_sbar_bg
-
 
 -- Create the indictor widget on window creation
 window.init_funcs.build_pindicator = function(w)
@@ -48,12 +50,19 @@ webview.init_funcs.prvt_update = function(view, w)
 	end)
 end
 
--- Method wrapper
+-- Updates widget based on status
 window.methods.update_prvt = function(w)
 	if not w.view then return end
     local private_br = w.view.enable_private_browsing
-    local prvt = w.sbar.r.prvt
 
+	local domain = (lousy.uri.parse(w.view.uri) or {}).host or ""
+    domain = string.match(domain, "^www%.(.+)") or domain
+	repeat
+		private_br = private_br or util.table.hasitem(nohist, domain)
+		domain = string.match(domain, "%.(.+)")
+	until not domain
+
+    local prvt = w.sbar.r.prvt
 	-- Set widget text based on privacy setting  
 	prvt.text = (private_br and indicator.private) or indicator.notprivate
 	-- Hide blank widget
@@ -70,10 +79,10 @@ history.add_signal("add", function (uri, title)
         domain = string.match(domain or "", "^www%.(.+)") or domain or "all"
         -- Build list of domains and subdomains, pulling private browsing.
         -- I.e. for luakit.org load .luakit.org, luakit.org, .org
-        local no_hist = domain_props.all.enable_private_browsing or false
-        no_hist = no_hist or (domain_props[domain] or {}).enable_private_browsing or false
+        local no_hist = domain_props.all.enable_private_browsing or (domain_props[domain] or {}).enable_private_browsing
         repeat
-            no_hist = no_hist or (domain_props["."..domain] or {}).enable_private_browsing or false
+            no_hist = no_hist or (domain_props["."..domain] or {}).enable_private_browsing
+			no_hist = no_hist or util.table.hasitem(nohist, domain)
             domain = string.match(domain, "%.(.+)")
         until not domain
         return not no_hist
